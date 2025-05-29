@@ -1,5 +1,5 @@
 from aiogram import Bot, Dispatcher
-from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
+from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, KeyboardButton, ReplyKeyboardMarkup
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -15,9 +15,18 @@ class OrderForm(StatesGroup):
     title = State()
     description = State()
 
+class ProjectForm(StatesGroup):
+    title = State()
+    description = State()
+
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
-    await message.reply("Привет! Я бот для управления заказами.")
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text="Проекты")]],
+        resize_keyboard=True
+    )
+    
+    await message.reply("Добро пожаловать в TeamReelBot!\n\nЯ помогу вам управлять проектами и заказами.\n\nДля администраторов доступна команда /admin", reply_markup=keyboard)
 
 @dp.message(Command("admin"))
 async def cmd_admin(message: Message):
@@ -31,6 +40,34 @@ async def cmd_admin(message: Message):
         ]
     )
     await message.reply("Админ панель", reply_markup=keyboard)
+
+@dp.message(lambda message: message.text == "Проекты")
+async def show_projects(message: Message):
+    orders = await Order.all()
+    if not orders:
+        await message.reply("Список проектов пуст")
+        return
+    
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=order.title, callback_data=f"order_{order.id}")] 
+            for order in orders
+        ]
+    )
+    
+    await message.reply("Список проектов:", reply_markup=keyboard)
+
+@dp.callback_query(lambda c: c.data.startswith("order_"))
+async def show_order_info(callback_query: CallbackQuery):
+    order_id = int(callback_query.data.split("_")[1])
+    order = await Order.get(id=order_id)
+    
+    await callback_query.message.edit_text(
+        f"Информация о проекте:\n\n"
+        f"Название: {order.title}\n"
+        f"Описание: {order.description}\n"
+        f"Создан: {order.created_at.strftime('%d.%m.%Y')}"
+    )
 
 @dp.callback_query(lambda c: c.data == "new_order")
 async def process_new_order(callback_query: CallbackQuery, state: FSMContext):
@@ -52,7 +89,7 @@ async def process_description(message: Message, state: FSMContext):
         description=message.text
     )
     
-    await message.reply(f"Заказ успешно создан!\n\nНазвание: {order.title}\nОписание: {order.description}")
+    await message.reply(f"Проект успешно создан!\n\nНазвание: {order.title}\nОписание: {order.description}")
     await state.clear()
 
 async def start_bot():
