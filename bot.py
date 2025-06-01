@@ -333,22 +333,27 @@ async def admin_completed_tasks_select_project(callback_query: CallbackQuery):
         await callback_query.message.edit_text("В этом проекте нет выполненных задач с прикрепленными файлами.")
         return
     
-    # Группируем задачи по типу (категории)
-    completed_task_types = {}
     project_title = tasks_with_files[0].order.title # Название проекта одно для всех задач
     
+    # Группируем задачи по типу (категории) и собираем исполнителей
+    completed_task_info = defaultdict(set) # Используем set для уникальных user_id
     for task in tasks_with_files:
-         if task.task_type not in completed_task_types:
-             completed_task_types[task.task_type] = True # Просто отмечаем, что этот тип задачи выполнен
+         completed_task_info[task.task_type].add(task.user_id)
     
     text = f"Выполненные категории задач в проекте \"{project_title}\"\n\n"
     keyboard_buttons = []
-    for task_type in completed_task_types.keys():
-        text += f"- {task_type}\n"
+    
+    for task_type, user_ids in completed_task_info.items():
+        text += f"<b>{task_type}</b>\n"
+        for user_id in user_ids:
+             user_link = f"<a href=\"tg://user?id={user_id}\">{user_id}</a>"
+             text += f"  Выполнил: {user_link}\n"
+             
         # Callback data будет включать project_id и task_type
         keyboard_buttons.append(
             [InlineKeyboardButton(text=f"Получить файлы для: {task_type}", callback_data=f"admin_get_category_files_{project_id}_{task_type}")]
         )
+        text += "\n"
     
     text += "\nДля просмотра файлов по категории нажмите соответствующую кнопку."
         
