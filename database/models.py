@@ -25,3 +25,16 @@ class Task(Model):
 
     def __str__(self):
         return f"{self.task_type} для {self.order.title} ({self.user_id})"
+
+class SubmittedFile(Model):
+    id = fields.IntField(pk=True)
+    task = fields.ForeignKeyField('models.Task', related_name='submitted_files')
+    file_id = fields.CharField(max_length=255)
+    file_type = fields.CharField(max_length=32) # 'document', 'photo', 'video'
+    uploaded_at = fields.DatetimeField(auto_now_add=True)
+
+    class Meta:
+        table = "submitted_files"
+
+    def __str__(self):
+        return f"{self.file_type} для задачи {self.task_id}"

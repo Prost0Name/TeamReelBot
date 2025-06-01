@@ -1,11 +1,11 @@
-from aiogram import Bot, Dispatcher
-from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, KeyboardButton, ReplyKeyboardMarkup
+from aiogram import Bot, Dispatcher, F
+from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery, KeyboardButton, ReplyKeyboardMarkup, FSInputFile, BufferedInputFile, InputMediaDocument, InputMediaPhoto, InputMediaVideo
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from config import BOT_TOKEN, ADMIN_ID
-from database.models import Order, Task
+from database.models import Order, Task, SubmittedFile
 from database import setup
 from collections import defaultdict
 
@@ -20,6 +20,12 @@ class ProjectForm(StatesGroup):
     title = State()
     description = State()
 
+class SubmitWorkForm(StatesGroup):
+    select_project = State()
+    select_task = State()
+    upload_files = State()
+    confirm = State()
+
 TASK_TYPE_MAP = {
     'script': 'Написание сценария',
     'voice': 'Озвучка',
@@ -31,11 +37,17 @@ TASK_TYPE_MAP = {
 @dp.message(CommandStart())
 async def cmd_start(message: Message):
     keyboard = ReplyKeyboardMarkup(
-        keyboard=[[KeyboardButton(text="Проекты")], [KeyboardButton(text="Мои задачи")]],
+        keyboard=[
+            [KeyboardButton(text="Проекты")],
+            [KeyboardButton(text="Мои задачи")],
+            [KeyboardButton(text="Сдать работу")]
+        ],
         resize_keyboard=True
     )
-    
-    await message.reply("Добро пожаловать в TeamReelBot!\n\nЯ помогу вам управлять проектами и заказами.\n\nДля администраторов доступна команда /admin", reply_markup=keyboard)
+    await message.reply(
+        "Добро пожаловать в TeamReelBot!\n\nЯ помогу вам управлять проектами и заказами.\n\nДля администраторов доступна команда /admin",
+        reply_markup=keyboard
+    )
 
 @dp.message(Command("admin"))
 async def cmd_admin(message: Message):
@@ -46,7 +58,8 @@ async def cmd_admin(message: Message):
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Новый заказ", callback_data="new_order")],
-            [InlineKeyboardButton(text="Список задач пользователей", callback_data="admin_tasks")]
+            [InlineKeyboardButton(text="Список задач пользователей", callback_data="admin_tasks")],
+            [InlineKeyboardButton(text="Выполненные задачи", callback_data="admin_completed_tasks_start")]
         ]
     )
     await message.reply("Админ панель", reply_markup=keyboard)
@@ -182,6 +195,202 @@ async def admin_tasks(callback_query: CallbackQuery):
             text += f"{task_type}: <a href=\"tg://user?id={user_id}\">{user_id}</a>\n"
         text += "\n"
     await callback_query.message.edit_text(text, parse_mode="HTML")
+
+@dp.message(lambda message: message.text == "Сдать работу")
+async def submit_work_start(message: Message, state: FSMContext):
+    user_id = str(message.from_user.id)
+    tasks = await Task.filter(user_id=user_id).prefetch_related('order')
+    if not tasks:
+        await message.reply("У вас нет задач для сдачи работы")
+        return
+    # Собираем уникальные проекты
+    projects = {task.order.id: task.order.title for task in tasks}
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=title, callback_data=f"submit_proj_{proj_id}")]
+            for proj_id, title in projects.items()
+        ]
+    )
+    await message.reply("Выберите проект:", reply_markup=keyboard)
+    await state.set_state(SubmitWorkForm.select_project)
+    await state.update_data(tasks=[{'id': t.id, 'order_id': t.order.id, 'order_title': t.order.title, 'task_type': t.task_type} for t in tasks])
+
+@dp.callback_query(lambda c: c.data.startswith("submit_proj_"), SubmitWorkForm.select_project)
+async def submit_work_select_project(callback_query: CallbackQuery, state: FSMContext):
+    project_id = int(callback_query.data.split("_")[-1])
+    data = await state.get_data()
+    user_tasks = [t for t in data['tasks'] if t['order_id'] == project_id]
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=t['task_type'], callback_data=f"submit_task_{t['id']}")]
+            for t in user_tasks
+        ]
+    )
+    await callback_query.message.edit_text("Выберите задачу:", reply_markup=keyboard)
+    await state.set_state(SubmitWorkForm.select_task)
+    await state.update_data(selected_project=project_id)
+
+@dp.callback_query(lambda c: c.data.startswith("submit_task_"), SubmitWorkForm.select_task)
+async def submit_work_select_task(callback_query: CallbackQuery, state: FSMContext):
+    task_id = int(callback_query.data.split("_")[-1])
+    await state.update_data(selected_task=task_id, files=[])
+    await callback_query.message.edit_text("Прикрепите файлы (можно несколько). После загрузки всех файлов нажмите 'Отправить на проверку'.")
+    await state.set_state(SubmitWorkForm.upload_files)
+    # Кнопка для отправки на проверку
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Отправить на проверку", callback_data="submit_confirm")]
+        ]
+    )
+    await callback_query.message.answer("Загрузите файлы, затем нажмите:", reply_markup=keyboard)
+
+@dp.message(SubmitWorkForm.upload_files, F.content_type.in_(["document", "photo", "video"]))
+async def submit_work_upload_file(message: Message, state: FSMContext):
+    data = await state.get_data()
+    files = data.get('files', [])
+    file_info = None
+    if message.document:
+        file_info = {'file_id': message.document.file_id, 'type': 'document'}
+    elif message.photo:
+        # Для фото берем последний элемент из списка размеров, т.к. он самый большой
+        file_info = {'file_id': message.photo[-1].file_id, 'type': 'photo'}
+    elif message.video:
+        file_info = {'file_id': message.video.file_id, 'type': 'video'}
+    
+    if file_info:
+        files.append(file_info)
+        await state.update_data(files=files)
+        await message.reply("Файл добавлен. Можете добавить ещё или нажмите 'Отправить на проверку'.")
+    else:
+         # Это сообщение, скорее всего, не будет достигнуто из-за фильтра F, но на всякий случай.
+         await message.reply("Пожалуйста, прикрепите документ, фото или видео.")
+
+@dp.callback_query(lambda c: c.data == "submit_confirm", SubmitWorkForm.upload_files)
+async def submit_work_confirm(callback_query: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    files_to_save = data.get('files', [])
+    task_id = data.get('selected_task')
+
+    if not files_to_save:
+        await callback_query.answer("Сначала прикрепите хотя бы один файл!", show_alert=True)
+        return
+    
+    # Получаем объект задачи
+    task = await Task.get(id=task_id)
+
+    # Сохраняем информацию о файлах в базе данных
+    saved_count = 0
+    for file_info in files_to_save:
+        # Проверяем, не был ли этот файл уже прикреплен к этой задаче
+        existing_file = await SubmittedFile.filter(task=task, file_id=file_info['file_id']).first()
+        if not existing_file:
+            await SubmittedFile.create(
+                task=task,
+                file_id=file_info['file_id'],
+                file_type=file_info['type']
+            )
+            saved_count += 1
+
+    if saved_count > 0:
+        await callback_query.message.edit_text(f"Работа ({saved_count} новых файл(а/ов)) прикреплена к задаче.\nОжидайте проверки администратором.")
+    else:
+         await callback_query.message.edit_text("Выбранные файлы уже были прикреплены к этой задаче.")
+         
+    await state.clear() # Очищаем состояние после сохранения
+
+@dp.callback_query(lambda c: c.data == "admin_completed_tasks_start")
+async def admin_completed_tasks_start(callback_query: CallbackQuery):
+    # Находим все задачи, у которых есть прикрепленные файлы
+    tasks_with_files = await Task.filter(submitted_files__isnull=False).distinct().prefetch_related('order')
+    
+    if not tasks_with_files:
+        await callback_query.message.edit_text("Нет выполненных задач с прикрепленными файлами.")
+        return
+    
+    # Группируем задачи по проектам
+    projects = {}
+    for task in tasks_with_files:
+        if task.order.id not in projects:
+            projects[task.order.id] = task.order.title
+            
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=title, callback_data=f"admin_completed_proj_{proj_id}")]
+            for proj_id, title in projects.items()
+        ]
+    )
+    
+    await callback_query.message.edit_text("Выберите проект для просмотра выполненных задач:", reply_markup=keyboard)
+
+@dp.callback_query(lambda c: c.data.startswith("admin_completed_proj_"))
+async def admin_completed_tasks_select_project(callback_query: CallbackQuery):
+    project_id = int(callback_query.data.split("_")[-1])
+    
+    # Находим задачи для этого проекта, у которых есть прикрепленные файлы
+    tasks = await Task.filter(order_id=project_id, submitted_files__isnull=False).prefetch_related('order')
+    
+    if not tasks:
+        # Этого не должно произойти, если admin_completed_tasks_start работает правильно, но на всякий случай.
+        await callback_query.message.edit_text("В этом проекте нет выполненных задач с прикрепленными файлами.")
+        return
+    
+    text = f"Выполненные задачи в проекте \"{tasks[0].order.title}\"\n\n"
+    keyboard_buttons = []
+    for task in tasks:
+        user_link = f"<a href=\"tg://user?id={task.user_id}\">{task.user_id}</a>"
+        text += f"Задача: {task.task_type}\nВыполнил: {user_link}\n"
+        keyboard_buttons.append(
+            [InlineKeyboardButton(text=f"Получить файлы для: {task.task_type}", callback_data=f"admin_get_files_{task.id}")]
+        )
+        text += "\n"
+        
+    keyboard_buttons.append([InlineKeyboardButton(text="Назад к проектам", callback_data="admin_completed_tasks_start")])
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+    
+    await callback_query.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+
+@dp.callback_query(lambda c: c.data.startswith("admin_get_files_"))
+async def admin_get_task_files(callback_query: CallbackQuery):
+    task_id = int(callback_query.data.split("_")[-1])
+    
+    submitted_files = await SubmittedFile.filter(task_id=task_id)
+    
+    if not submitted_files:
+        await callback_query.answer("Для этой задачи нет прикрепленных файлов.", show_alert=True)
+        return
+    
+    await callback_query.answer("Отправляю файлы...", show_alert=True)
+    
+    # Отправляем файлы. Сгруппируем фото и видео в медиа-группу, документы по одному.
+    media_group_items = []
+    document_items = []
+    
+    task = await Task.get(id=task_id).prefetch_related('order') # Получим инфо о задаче для подписи/описания
+    caption_text = f"Файлы для задачи \"{task.task_type}\" в проекте \"{task.order.title}\" от пользователя <a href=\"tg://user?id={task.user_id}\">{task.user_id}</a>"
+
+    for file_info in submitted_files:
+        if file_info.file_type == 'photo':
+            media_group_items.append(InputMediaPhoto(media=file_info.file_id))
+        elif file_info.file_type == 'video':
+            media_group_items.append(InputMediaVideo(media=file_info.file_id))
+        elif file_info.file_type == 'document':
+            document_items.append(file_info.file_id)
+
+    # Отправляем медиа-группу
+    if media_group_items:
+        # Первому элементу медиа-группы можно добавить подпись
+        media_group_items[0].caption = caption_text
+        media_group_items[0].parse_mode = "HTML"
+        await bot.send_media_group(callback_query.message.chat.id, media_group_items)
+        
+    # Отправляем документы отдельно
+    for doc_file_id in document_items:
+        # Для документов можно отправить подпись отдельно или в первом документе
+        await bot.send_document(callback_query.message.chat.id, doc_file_id) # Проще без подписи в цикле
+        
+    # Можно отправить финальное сообщение после отправки всех файлов
+    # await bot.send_message(callback_query.message.chat.id, "Все файлы отправлены.")
 
 async def start_bot():
     await setup()
