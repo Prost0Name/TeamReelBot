@@ -326,23 +326,31 @@ async def admin_completed_tasks_start(callback_query: CallbackQuery):
 async def admin_completed_tasks_select_project(callback_query: CallbackQuery):
     project_id = int(callback_query.data.split("_")[-1])
     
-    # Находим задачи для этого проекта, у которых есть прикрепленные файлы
-    tasks = await Task.filter(order_id=project_id, submitted_files__isnull=False).prefetch_related('order')
+    # Находим все задачи для этого проекта, у которых есть прикрепленные файлы
+    tasks_with_files = await Task.filter(order_id=project_id, submitted_files__isnull=False).prefetch_related('order')
     
-    if not tasks:
-        # Этого не должно произойти, если admin_completed_tasks_start работает правильно, но на всякий случай.
+    if not tasks_with_files:
         await callback_query.message.edit_text("В этом проекте нет выполненных задач с прикрепленными файлами.")
         return
     
-    text = f"Выполненные задачи в проекте \"{tasks[0].order.title}\"\n\n"
+    # Группируем задачи по типу (категории)
+    completed_task_types = {}
+    project_title = tasks_with_files[0].order.title # Название проекта одно для всех задач
+    
+    for task in tasks_with_files:
+         if task.task_type not in completed_task_types:
+             completed_task_types[task.task_type] = True # Просто отмечаем, что этот тип задачи выполнен
+    
+    text = f"Выполненные категории задач в проекте \"{project_title}\"\n\n"
     keyboard_buttons = []
-    for task in tasks:
-        user_link = f"<a href=\"tg://user?id={task.user_id}\">{task.user_id}</a>"
-        text += f"Задача: {task.task_type}\nВыполнил: {user_link}\n"
+    for task_type in completed_task_types.keys():
+        text += f"- {task_type}\n"
+        # Callback data будет включать project_id и task_type
         keyboard_buttons.append(
-            [InlineKeyboardButton(text=f"Получить файлы для: {task.task_type}", callback_data=f"admin_get_files_{task.id}")]
+            [InlineKeyboardButton(text=f"Получить файлы для: {task_type}", callback_data=f"admin_get_category_files_{project_id}_{task_type}")]
         )
-        text += "\n"
+    
+    text += "\nДля просмотра файлов по категории нажмите соответствующую кнопку."
         
     keyboard_buttons.append([InlineKeyboardButton(text="Назад к проектам", callback_data="admin_completed_tasks_start")])
     
@@ -350,26 +358,40 @@ async def admin_completed_tasks_select_project(callback_query: CallbackQuery):
     
     await callback_query.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
 
-@dp.callback_query(lambda c: c.data.startswith("admin_get_files_"))
-async def admin_get_task_files(callback_query: CallbackQuery):
-    task_id = int(callback_query.data.split("_")[-1])
+# Новый обработчик для получения файлов по категории
+@dp.callback_query(lambda c: c.data.startswith("admin_get_category_files_"))
+async def admin_get_category_files(callback_query: CallbackQuery):
+    parts = callback_query.data.split("_")
+    project_id = int(parts[-2])
+    task_type = parts[-1]
     
-    submitted_files = await SubmittedFile.filter(task_id=task_id)
+    # Находим все задачи этого типа в проекте
+    tasks_in_category = await Task.filter(order_id=project_id, task_type=task_type).prefetch_related('submitted_files')
     
-    if not submitted_files:
-        await callback_query.answer("Для этой задачи нет прикрепленных файлов.", show_alert=True)
+    if not tasks_in_category:
+        await callback_query.answer("Нет задач этой категории в проекте.", show_alert=True)
         return
-    
-    await callback_query.answer("Отправляю файлы...", show_alert=True)
+        
+    all_submitted_files = []
+    for task in tasks_in_category:
+        for submitted_file in task.submitted_files:
+            all_submitted_files.append(submitted_file)
+            
+    if not all_submitted_files:
+        await callback_query.answer("Для этой категории задач нет прикрепленных файлов.", show_alert=True)
+        return
+        
+    await callback_query.answer("Отправляю файлы по категории...", show_alert=True)
     
     # Отправляем файлы. Сгруппируем фото и видео в медиа-группу, документы по одному.
     media_group_items = []
     document_items = []
     
-    task = await Task.get(id=task_id).prefetch_related('order') # Получим инфо о задаче для подписи/описания
-    caption_text = f"Файлы для задачи \"{task.task_type}\" в проекте \"{task.order.title}\" от пользователя <a href=\"tg://user?id={task.user_id}\">{task.user_id}</a>"
+    # Получим название проекта и тип задачи для подписи/описания
+    project = await Order.get(id=project_id)
+    caption_text = f"Файлы для категории \"{task_type}\" в проекте \"{project.title}\""
 
-    for file_info in submitted_files:
+    for file_info in all_submitted_files:
         if file_info.file_type == 'photo':
             media_group_items.append(InputMediaPhoto(media=file_info.file_id))
         elif file_info.file_type == 'video':
@@ -386,11 +408,10 @@ async def admin_get_task_files(callback_query: CallbackQuery):
         
     # Отправляем документы отдельно
     for doc_file_id in document_items:
-        # Для документов можно отправить подпись отдельно или в первом документе
-        await bot.send_document(callback_query.message.chat.id, doc_file_id) # Проще без подписи в цикле
+        await bot.send_document(callback_query.message.chat.id, doc_file_id) 
         
     # Можно отправить финальное сообщение после отправки всех файлов
-    # await bot.send_message(callback_query.message.chat.id, "Все файлы отправлены.")
+    # await bot.send_message(callback_query.message.chat.id, "Все файлы отправлены по категории.")
 
 async def start_bot():
     await setup()
