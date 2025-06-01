@@ -38,9 +38,8 @@ TASK_TYPE_MAP = {
 async def cmd_start(message: Message):
     keyboard = ReplyKeyboardMarkup(
         keyboard=[
-            [KeyboardButton(text="Проекты")],
-            [KeyboardButton(text="Мои задачи")],
-            [KeyboardButton(text="Сдать работу")]
+            [KeyboardButton(text="📋 Проекты")],
+            [KeyboardButton(text="📝 Мои задачи"), KeyboardButton(text="📤 Сдать работу")]
         ],
         resize_keyboard=True
     )
@@ -64,7 +63,7 @@ async def cmd_admin(message: Message):
     )
     await message.reply("Админ панель", reply_markup=keyboard)
 
-@dp.message(lambda message: message.text == "Проекты")
+@dp.message(lambda message: message.text == "📋 Проекты")
 async def show_projects(message: Message):
     orders = await Order.all()
     if not orders:
@@ -166,7 +165,7 @@ async def take_task(callback_query: CallbackQuery):
     await Task.create(order_id=order_id, user_id=user_id, task_type=task_type)
     await callback_query.answer(f"Вы взялись за: {task_type}", show_alert=True)
 
-@dp.message(lambda message: message.text == "Мои задачи")
+@dp.message(lambda message: message.text == "📝 Мои задачи")
 async def my_tasks(message: Message):
     user_id = str(message.from_user.id)
     tasks = await Task.filter(user_id=user_id).prefetch_related('order')
@@ -196,7 +195,7 @@ async def admin_tasks(callback_query: CallbackQuery):
         text += "\n"
     await callback_query.message.edit_text(text, parse_mode="HTML")
 
-@dp.message(lambda message: message.text == "Сдать работу")
+@dp.message(lambda message: message.text == "📤 Сдать работу")
 async def submit_work_start(message: Message, state: FSMContext):
     user_id = str(message.from_user.id)
     tasks = await Task.filter(user_id=user_id).prefetch_related('order')
