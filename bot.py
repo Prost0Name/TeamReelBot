@@ -56,7 +56,7 @@ async def cmd_start(message: Message):
 
 @dp.message(Command("admin"))
 async def cmd_admin(message: Message):
-    if str(message.from_user.id) != ADMIN_ID:
+    if str(message.from_user.id) not in ADMIN_ID:
         await message.reply("У вас нет прав администратора")
         return
     
