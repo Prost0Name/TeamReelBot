@@ -8,6 +8,8 @@ from config import BOT_TOKEN, ADMIN_ID
 from database.models import Order, Task, SubmittedFile
 from database import setup
 from collections import defaultdict
+from tortoise import fields, models
+from datetime import datetime
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -25,6 +27,10 @@ class SubmitWorkForm(StatesGroup):
     select_task = State()
     upload_files = State()
     confirm = State()
+
+# Новые состояния для процесса отклонения задачи администратором
+class AdminRejectTaskForm(StatesGroup):
+    reason = State()
 
 TASK_TYPE_MAP = {
     'script': 'Написание сценария',
@@ -85,13 +91,23 @@ async def show_order_info(callback_query: CallbackQuery):
     order = await Order.get(id=order_id)
     
     # Кнопки задач
-    task_buttons = [
-        InlineKeyboardButton(text="Написание сценария", callback_data=f"task_script_{order_id}"),
-        InlineKeyboardButton(text="Озвучка", callback_data=f"task_voice_{order_id}"),
-        InlineKeyboardButton(text="Монтаж", callback_data=f"task_edit_{order_id}"),
-        InlineKeyboardButton(text="Создание превью", callback_data=f"task_preview_{order_id}"),
-        InlineKeyboardButton(text="Отгрузка видео", callback_data=f"task_upload_{order_id}")
+    task_types = [
+        ('script', 'Написание сценария'),
+        ('voice', 'Озвучка'),
+        ('edit', 'Монтаж'),
+        ('preview', 'Создание превью'),
+        ('upload', 'Отгрузка видео')
     ]
+    
+    task_buttons = []
+    for key, text in task_types:
+        # Проверяем, есть ли задача этого типа для данного заказа
+        existing_task = await Task.filter(order_id=order_id, task_type=text).first()
+        button_text = text
+        if existing_task:
+            button_text += " (Занято)"
+        task_buttons.append(InlineKeyboardButton(text=button_text, callback_data=f"task_{key}_{order_id}"))
+
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
             [btn] for btn in task_buttons
@@ -168,14 +184,32 @@ async def take_task(callback_query: CallbackQuery):
 @dp.message(lambda message: message.text == "📝 Мои задачи")
 async def my_tasks(message: Message):
     user_id = str(message.from_user.id)
+    # Получаем задачи пользователя, предварительно загружая информацию о проекте
     tasks = await Task.filter(user_id=user_id).prefetch_related('order')
     if not tasks:
         await message.reply("У вас нет активных задач")
         return
-    text = "Ваши задачи:\n\n"
+    
+    # Группируем задачи по проектам и собираем информацию о статусе
+    project_tasks_info = defaultdict(list) # {project_title: [(task_type, status)]}
     for task in tasks:
-        text += f"Проект: {task.order.title}\nЗадача: {task.task_type}\n\n"
-    await message.reply(text)
+        project_tasks_info[task.order.title].append((task.task_type, task.status))
+    
+    text = "Ваши задачи:\n\n"
+    for project, task_list in project_tasks_info.items():
+        text += f"Проект: <b>{project}</b>\n"
+        for task_type, status in task_list:
+            status_text = ""
+            if status == 'approved':
+                status_text = " (Выполнено ✅)"
+            elif status == 'rejected':
+                status_text = " (Требуются доработки ❌)"
+            # Для статуса 'pending' ничего не добавляем
+                
+            text += f"  - {task_type}{status_text}\n"
+        text += "\n"
+        
+    await message.reply(text, parse_mode="HTML")
 
 @dp.callback_query(lambda c: c.data == "admin_tasks")
 async def admin_tasks(callback_query: CallbackQuery):
@@ -198,10 +232,13 @@ async def admin_tasks(callback_query: CallbackQuery):
 @dp.message(lambda message: message.text == "📤 Сдать работу")
 async def submit_work_start(message: Message, state: FSMContext):
     user_id = str(message.from_user.id)
-    tasks = await Task.filter(user_id=user_id).prefetch_related('order')
+    # Получаем задачи пользователя, которые НЕ одобрены
+    tasks = await Task.filter(user_id=user_id, status__not='approved').prefetch_related('order')
+
     if not tasks:
-        await message.reply("У вас нет задач для сдачи работы")
+        await message.reply("У вас нет задач для сдачи работы (или все задачи уже одобрены).")
         return
+    
     # Собираем уникальные проекты
     projects = {task.order.id: task.order.title for task in tasks}
     keyboard = InlineKeyboardMarkup(
@@ -233,15 +270,20 @@ async def submit_work_select_project(callback_query: CallbackQuery, state: FSMCo
 async def submit_work_select_task(callback_query: CallbackQuery, state: FSMContext):
     task_id = int(callback_query.data.split("_")[-1])
     await state.update_data(selected_task=task_id, files=[])
-    await callback_query.message.edit_text("Прикрепите файлы (можно несколько). После загрузки всех файлов нажмите 'Отправить на проверку'.")
-    await state.set_state(SubmitWorkForm.upload_files)
-    # Кнопка для отправки на проверку
+    
+    # Кнопки для отправки на проверку и Назад
     keyboard = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Отправить на проверку", callback_data="submit_confirm")]
+            [InlineKeyboardButton(text="Отправить на проверку", callback_data="submit_confirm")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="submit_back_to_tasks")] # Кнопка Назад
         ]
     )
+
+    await callback_query.message.edit_text(
+        "Прикрепите файлы (можно несколько). После загрузки всех файлов нажмите 'Отправить на проверку'."
+    )
     await callback_query.message.answer("Загрузите файлы, затем нажмите:", reply_markup=keyboard)
+    await state.set_state(SubmitWorkForm.upload_files)
 
 @dp.message(SubmitWorkForm.upload_files, F.content_type.in_(["document", "photo", "video"]))
 async def submit_work_upload_file(message: Message, state: FSMContext):
@@ -321,81 +363,75 @@ async def admin_completed_tasks_start(callback_query: CallbackQuery):
     
     await callback_query.message.edit_text("Выберите проект для просмотра выполненных задач:", reply_markup=keyboard)
 
-@dp.callback_query(lambda c: c.data.startswith("admin_completed_proj_"))
-async def admin_completed_tasks_select_project(callback_query: CallbackQuery):
-    project_id = int(callback_query.data.split("_")[-1])
-    
+# Вспомогательная функция для отображения выполненных задач по проекту
+async def display_completed_tasks_for_project(message, project_id):
     # Находим все задачи для этого проекта, у которых есть прикрепленные файлы
-    tasks_with_files = await Task.filter(order_id=project_id, submitted_files__isnull=False).prefetch_related('order')
+    tasks_with_files = await Task.filter(order_id=project_id, submitted_files__isnull=False).distinct().prefetch_related('order')
     
     if not tasks_with_files:
-        await callback_query.message.edit_text("В этом проекте нет выполненных задач с прикрепленными файлами.")
+        await message.edit_text("В этом проекте нет выполненных задач с прикрепленными файлами.")
         return
     
     project_title = tasks_with_files[0].order.title # Название проекта одно для всех задач
     
-    # Группируем задачи по типу (категории) и собираем исполнителей
-    completed_task_info = defaultdict(set) # Используем set для уникальных user_id
-    for task in tasks_with_files:
-         completed_task_info[task.task_type].add(task.user_id)
-    
-    text = f"Выполненные категории задач в проекте \"{project_title}\"\n\n"
+    text = f"Задачи с прикрепленными файлами в проекте \"{project_title}\"\n\n"
     keyboard_buttons = []
     
-    for task_type, user_ids in completed_task_info.items():
-        text += f"<b>{task_type}</b>\n"
-        for user_id in user_ids:
-             user_link = f"<a href=\"tg://user?id={user_id}\">{user_id}</a>"
-             text += f"  Выполнил: {user_link}\n"
-             
-        # Callback data будет включать project_id и task_type
-        keyboard_buttons.append(
-            [InlineKeyboardButton(text=f"Получить файлы для: {task_type}", callback_data=f"admin_get_category_files_{project_id}_{task_type}")]
-        )
+    # Группируем задачи по типу и исполнителю (т.е. уникальные задачи)
+    unique_tasks = defaultdict(dict) # {user_id: {task_type: task_object}}
+    for task in tasks_with_files:
+        unique_tasks[task.user_id][task.task_type] = task
+
+    for user_id, tasks_by_type in unique_tasks.items():
+        user_link = f"<a href=\"tg://user?id={user_id}\">{user_id}</a>"
+        text += f"Исполнитель: {user_link}\n"
+        for task_type, task in tasks_by_type.items():
+            status_text = {
+                'pending': 'Ожидает одобрения ⏳',
+                'approved': 'Одобрено ✅',
+                'rejected': 'Отклонено ❌'
+            }.get(task.status, task.status) # Отображаем статус с эмодзи
+            
+            text += f"  - {task_type} ({status_text})\n"
+            # Кнопка для просмотра файлов конкретной задачи пользователя
+            keyboard_buttons.append(
+                [InlineKeyboardButton(text=f"📂 Файлы {task_type} от {user_id}", callback_data=f"admin_view_task_files_{task.id}")]
+            )
         text += "\n"
     
-    text += "\nДля просмотра файлов по категории нажмите соответствующую кнопку."
-        
-    keyboard_buttons.append([InlineKeyboardButton(text="Назад к проектам", callback_data="admin_completed_tasks_start")])
+    keyboard_buttons.append([InlineKeyboardButton(text="⬅️ Назад к проектам", callback_data="admin_completed_tasks_start")])
     
     keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
     
-    await callback_query.message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
+    await message.edit_text(text, reply_markup=keyboard, parse_mode="HTML")
 
-# Новый обработчик для получения файлов по категории
-@dp.callback_query(lambda c: c.data.startswith("admin_get_category_files_"))
-async def admin_get_category_files(callback_query: CallbackQuery):
-    parts = callback_query.data.split("_")
-    project_id = int(parts[-2])
-    task_type = parts[-1]
+@dp.callback_query(lambda c: c.data.startswith("admin_completed_proj_"))
+async def admin_completed_tasks_select_project(callback_query: CallbackQuery):
+    project_id = int(callback_query.data.split("_")[-1])
+    await display_completed_tasks_for_project(callback_query.message, project_id)
+
+# НОВЫЙ ОБРАБОТЧИК для просмотра файлов конкретной задачи
+@dp.callback_query(lambda c: c.data.startswith("admin_view_task_files_"))
+async def admin_view_task_files(callback_query: CallbackQuery):
+    task_id = int(callback_query.data.split("_")[-1])
     
-    # Находим все задачи этого типа в проекте
-    tasks_in_category = await Task.filter(order_id=project_id, task_type=task_type).prefetch_related('submitted_files')
+    task = await Task.get(id=task_id).prefetch_related('submitted_files', 'order')
     
-    if not tasks_in_category:
-        await callback_query.answer("Нет задач этой категории в проекте.", show_alert=True)
+    if not task.submitted_files:
+        await callback_query.answer("Для этой задачи нет прикрепленных файлов.", show_alert=True)
+        # Вернуться к списку задач проекта
+        await display_completed_tasks_for_project(callback_query.message, task.order.id) # Используем новую вспомогательную функцию
         return
         
-    all_submitted_files = []
-    for task in tasks_in_category:
-        for submitted_file in task.submitted_files:
-            all_submitted_files.append(submitted_file)
-            
-    if not all_submitted_files:
-        await callback_query.answer("Для этой категории задач нет прикрепленных файлов.", show_alert=True)
-        return
-        
-    await callback_query.answer("Отправляю файлы по категории...", show_alert=True)
+    await callback_query.answer("Отправляю файлы задачи...", show_alert=True)
     
-    # Отправляем файлы. Сгруппируем фото и видео в медиа-группу, документы по одному.
     media_group_items = []
     document_items = []
     
-    # Получим название проекта и тип задачи для подписи/описания
-    project = await Order.get(id=project_id)
-    caption_text = f"Файлы для категории \"{task_type}\" в проекте \"{project.title}\""
+    project_title = task.order.title
+    caption_text = f"Файлы для задачи \"{task.task_type}\" в проекте \"{project_title}\" от пользователя <a href=\"tg://user?id={task.user_id}\">{task.user_id}</a>"
 
-    for file_info in all_submitted_files:
+    for file_info in task.submitted_files:
         if file_info.file_type == 'photo':
             media_group_items.append(InputMediaPhoto(media=file_info.file_id))
         elif file_info.file_type == 'video':
@@ -412,10 +448,163 @@ async def admin_get_category_files(callback_query: CallbackQuery):
         
     # Отправляем документы отдельно
     for doc_file_id in document_items:
-        await bot.send_document(callback_query.message.chat.id, doc_file_id) 
+        await bot.send_document(callback_query.message.chat.id, doc_file_id)
         
-    # Можно отправить финальное сообщение после отправки всех файлов
-    # await bot.send_message(callback_query.message.chat.id, "Все файлы отправлены по категории.")
+    # Кнопки Одобрить/Отклонить после отправки файлов
+    approve_reject_keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Одобрить", callback_data=f"admin_approve_task_{task.id}")],
+            [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"admin_reject_task_{task.id}")]
+        ]
+    )
+    await bot.send_message(callback_query.message.chat.id, "Выберите действие по этой задаче:", reply_markup=approve_reject_keyboard)
+
+# НОВЫЙ ОБРАБОТЧИК для одобрения задачи
+@dp.callback_query(lambda c: c.data.startswith("admin_approve_task_"))
+async def admin_approve_task(callback_query: CallbackQuery):
+    task_id = int(callback_query.data.split("_")[-1])
+    
+    task = await Task.get(id=task_id).prefetch_related('order')
+    task.status = 'approved'
+    # Также можно установить is_completed в True, если одобрение означает завершение
+    task.is_completed = True
+    await task.save()
+    
+    await callback_query.answer("Задача одобрена!", show_alert=True)
+    
+    # Опционально: отправить сообщение пользователю, что его задача одобрена
+    try:
+        await bot.send_message(int(task.user_id), f"✅ Ваша задача '{task.task_type}' в проекте '{task.order.title}' одобрена администратором.")
+    except Exception as e:
+        print(f"Не удалось отправить уведомление пользователю {task.user_id}: {e}")
+        
+    # Вернуться к списку задач проекта
+    await display_completed_tasks_for_project(callback_query.message, task.order.id) # Используем новую вспомогательную функцию
+
+# НОВЫЙ ОБРАБОТЧИК для отклонения задачи
+@dp.callback_query(lambda c: c.data.startswith("admin_reject_task_"))
+async def admin_reject_task(callback_query: CallbackQuery, state: FSMContext):
+    task_id = int(callback_query.data.split("_")[-1])
+    
+    # Сохраняем ID задачи в состоянии для последующего использования
+    await state.update_data(reject_task_id=task_id)
+    
+    # Добавляем кнопки "Пропустить" и "Назад"
+    keyboard = InlineKeyboardButton(text="Пропустить", callback_data="admin_reject_skip")
+    back_button = InlineKeyboardButton(text="⬅️ Назад", callback_data=f"admin_reject_back_{task_id}")
+    approve_reject_keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [keyboard],
+            [back_button]
+        ]
+    )
+    
+    await callback_query.message.edit_text(
+        "Пожалуйста, введите причину отклонения задачи:",
+        reply_markup=approve_reject_keyboard
+    )
+    await state.set_state(AdminRejectTaskForm.reason)
+
+# НОВЫЙ ОБРАБОТЧИК для получения причины отклонения
+@dp.message(AdminRejectTaskForm.reason)
+async def process_reject_reason(message: Message, state: FSMContext):
+    data = await state.get_data()
+    task_id = data.get('reject_task_id')
+    reject_reason = message.text
+
+    if not task_id:
+        await message.reply("Произошла ошибка, не удалось определить задачу для отклонения.")
+        await state.clear()
+        return
+
+    task = await Task.get(id=task_id).prefetch_related('order')
+    task.status = 'rejected'
+    task.is_completed = False # Отклоненная задача не считается выполненной
+    await task.save()
+    
+    await message.reply("Причина отклонения принята. Задача отклонена.")
+
+    # Отправить сообщение пользователю, что его задача отклонена, с указанием причины
+    try:
+        await bot.send_message(int(task.user_id), 
+            f"❌ Ваша задача '{task.task_type}' в проекте '{task.order.title}' была отклонена администратором.\n\n"
+            f"Причина: {reject_reason}\n\n"
+            f"Пожалуйста, проверьте предоставленные файлы и внесите необходимые исправления." # Или другое указание
+        )
+    except Exception as e:
+        print(f"Не удалось отправить уведомление пользователю {task.user_id}: {e}")
+        
+    await state.clear()
+    
+    # После отклонения и уведомления вернуться к списку задач проекта
+    return_keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Вернуться к задачам проекта", callback_data=f"admin_completed_proj_{task.order.id}")],
+            [InlineKeyboardButton(text="⬅️ Вернуться в админ панель", callback_data="admin")]
+        ]
+    )
+    await message.answer("Дальнейшие действия:", reply_markup=return_keyboard)
+
+# НОВЫЙ ОБРАБОТЧИК для кнопки "Пропустить" при отклонении
+@dp.callback_query(lambda c: c.data == "admin_reject_skip", AdminRejectTaskForm.reason)
+async def admin_reject_skip(callback_query: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    task_id = data.get('reject_task_id')
+
+    if not task_id:
+        await callback_query.message.edit_text("Произошла ошибка, не удалось определить задачу для отклонения.")
+        await state.clear()
+        return
+    
+    task = await Task.get(id=task_id).prefetch_related('order')
+    task.status = 'rejected'
+    task.is_completed = False
+    await task.save()
+    
+    await callback_query.message.edit_text("Причина не указана. Задача отклонена.")
+
+    # Отправить стандартное сообщение пользователю об отклонении
+    try:
+        await bot.send_message(int(task.user_id), f"❌ Ваша задача '{task.task_type}' в проекте '{task.order.title}' была отклонена администратором. Пожалуйста, проверьте предоставленные файлы.")
+    except Exception as e:
+        print(f"Не удалось отправить уведомление пользователю {task.user_id}: {e}")
+        
+    await state.clear()
+    
+    # Вернуться к списку задач проекта
+    return_keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Вернуться к задачам проекта", callback_data=f"admin_completed_proj_{task.order.id}")],
+            [InlineKeyboardButton(text="⬅️ Вернуться в админ панель", callback_data="admin")]
+        ]
+    )
+    await callback_query.message.answer("Дальнейшие действия:", reply_markup=return_keyboard)
+
+# НОВЫЙ ОБРАБОТЧИК для кнопки "Назад" при загрузке файлов
+@dp.callback_query(lambda c: c.data == "submit_back_to_tasks", SubmitWorkForm.upload_files)
+async def submit_back_to_tasks(callback_query: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    project_id = data.get('selected_project')
+    tasks = data.get('tasks') # Получаем список задач из сохраненных данных
+
+    if not project_id or not tasks:
+        await callback_query.message.edit_text("Произошла ошибка при возврате. Пожалуйста, начните заново через 'Сдать работу'.")
+        await state.clear()
+        await callback_query.answer()
+        return
+
+    user_tasks = [t for t in tasks if t['order_id'] == project_id]
+    
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=t['task_type'], callback_data=f"submit_task_{t['id']}")]
+            for t in user_tasks
+        ]
+    )
+    
+    await callback_query.message.edit_text("Выберите задачу:", reply_markup=keyboard)
+    await state.set_state(SubmitWorkForm.select_task) # Возвращаемся в состояние выбора задачи
+    await callback_query.answer() # Закрываем уведомление о нажатии кнопки
 
 async def start_bot():
     await setup()

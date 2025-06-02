@@ -19,6 +19,8 @@ class Task(Model):
     user_id = fields.CharField(max_length=32)  # Telegram user id
     task_type = fields.CharField(max_length=32)  # Например: сценарий, озвучка и т.д.
     created_at = fields.DatetimeField(auto_now_add=True)
+    # Добавляем поле статуса для отслеживания одобрения администратором
+    status = fields.CharField(max_length=50, default='pending') # 'pending', 'approved', 'rejected'
 
     class Meta:
         table = "tasks"
